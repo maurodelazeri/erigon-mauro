@@ -279,12 +279,52 @@ func (r *PointInTimeRedisStateReader) ReadAccountStorage(address libcommon.Addre
 	return []byte(values[0]), nil
 }
 
+// accessList is a simple implementation of an access list for our RedisIntraBlockState
+type accessList struct {
+	addresses map[libcommon.Address]bool
+	slots     map[libcommon.Address]map[libcommon.Hash]bool
+}
+
+func newAccessList() *accessList {
+	return &accessList{
+		addresses: make(map[libcommon.Address]bool),
+		slots:     make(map[libcommon.Address]map[libcommon.Hash]bool),
+	}
+}
+
+func (al *accessList) ContainsAddress(addr libcommon.Address) bool {
+	return al.addresses[addr]
+}
+
+func (al *accessList) AddAddress(addr libcommon.Address) bool {
+	if al.addresses[addr] {
+		return false
+	}
+	al.addresses[addr] = true
+	return true
+}
+
+func (al *accessList) AddSlot(addr libcommon.Address, slot libcommon.Hash) (bool, bool) {
+	addrChange := al.AddAddress(addr)
+	
+	if al.slots[addr] == nil {
+		al.slots[addr] = make(map[libcommon.Hash]bool)
+	}
+	
+	if al.slots[addr][slot] {
+		return addrChange, false
+	}
+	
+	al.slots[addr][slot] = true
+	return addrChange, true
+}
+
 // RedisIntraBlockState implements the evmtypes.IntraBlockState interface using Redis
 type RedisIntraBlockState struct {
 	stateReader state.StateReader
 	blockNum    uint64
 	hooks       *tracing.Hooks
-	accessList  *types.AccessList
+	accessList  *accessList
 	refund      uint64
 }
 
@@ -293,7 +333,7 @@ func NewRedisIntraBlockState(stateReader state.StateReader, blockNum uint64) *Re
 	return &RedisIntraBlockState{
 		stateReader: stateReader,
 		blockNum:    blockNum,
-		accessList:  &types.AccessList{},
+		accessList:  newAccessList(),
 	}
 }
 
@@ -507,26 +547,58 @@ func (s *RedisIntraBlockState) Empty(addr libcommon.Address) (bool, error) {
 // Prepare prepares the access list from rules and transactions
 func (s *RedisIntraBlockState) Prepare(rules *chain.Rules, sender, coinbase libcommon.Address, dest *libcommon.Address,
 	precompiles []libcommon.Address, txAccesses types.AccessList, authorities []libcommon.Address) error {
-	// TODO: implement
+
+	// Convert the transaction access list to the internal one
+	s.accessList = newAccessList()
+	for _, access := range txAccesses {
+		s.accessList.AddAddress(access.Address)
+		for _, key := range access.StorageKeys {
+			s.accessList.AddSlot(access.Address, key)
+		}
+	}
+
+	// Add the sender, coinbase and precompiled addresses
+	s.accessList.AddAddress(sender)
+	s.accessList.AddAddress(coinbase)
+	for _, addr := range precompiles {
+		s.accessList.AddAddress(addr)
+	}
+
+	// Add destination if there is one
+	if dest != nil {
+		s.accessList.AddAddress(*dest)
+	}
+
+	// Add authorities if provided
+	for _, authority := range authorities {
+		s.accessList.AddAddress(authority)
+	}
+
 	return nil
 }
 
 // AddressInAccessList returns whether an address is in the access list
 func (s *RedisIntraBlockState) AddressInAccessList(addr libcommon.Address) bool {
-	// TODO: implement
-	return true
+	if s.accessList == nil {
+		return false
+	}
+	return s.accessList.ContainsAddress(addr)
 }
 
 // AddAddressToAccessList adds an address to the access list
 func (s *RedisIntraBlockState) AddAddressToAccessList(addr libcommon.Address) bool {
-	// TODO: implement
-	return true
+	if s.accessList == nil {
+		s.accessList = newAccessList()
+	}
+	return s.accessList.AddAddress(addr)
 }
 
 // AddSlotToAccessList adds a slot to the access list
 func (s *RedisIntraBlockState) AddSlotToAccessList(addr libcommon.Address, slot libcommon.Hash) (bool, bool) {
-	// TODO: implement
-	return true, true
+	if s.accessList == nil {
+		s.accessList = newAccessList()
+	}
+	return s.accessList.AddSlot(addr, slot)
 }
 
 // RevertToSnapshot reverts to a given snapshot
