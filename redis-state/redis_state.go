@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
@@ -59,17 +60,19 @@ type SerializedAccount struct {
 
 // NewRedisStateReader creates a new instance of RedisStateReader
 func NewRedisStateReader(client *redis.Client) *RedisStateReader {
+	ctx, _ := context.WithCancel(context.Background())
 	return &RedisStateReader{
 		client: client,
-		ctx:    context.Background(),
+		ctx:    ctx,
 	}
 }
 
 // NewRedisStateWriter creates a new instance of RedisStateWriter
 func NewRedisStateWriter(client *redis.Client, blockNum uint64) *RedisStateWriter {
+	ctx, _ := context.WithCancel(context.Background())
 	return &RedisStateWriter{
 		client:   client,
-		ctx:      context.Background(),
+		ctx:      ctx,
 		blockNum: blockNum,
 	}
 }
@@ -120,10 +123,13 @@ func codeKey(codeHash libcommon.Hash) string {
 
 // ReadAccountData reads account data from Redis
 func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts.Account, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
+	defer cancel()
+	
 	key := accountKey(address)
 
 	// Get the most recent account data before or at current block
-	result := r.client.ZRevRangeByScore(r.ctx, key, &redis.ZRangeBy{
+	result := r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 		Min:    "0",
 		Max:    "+inf",
 		Offset: 0,
@@ -131,6 +137,9 @@ func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts
 	})
 
 	if result.Err() != nil {
+		if result.Err() == redis.Nil {
+			return nil, nil // Account doesn't exist
+		}
 		return nil, result.Err()
 	}
 
@@ -145,12 +154,12 @@ func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts
 
 	var serialized SerializedAccount
 	if err := json.Unmarshal([]byte(values[0]), &serialized); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid account data for %s: %w", address.Hex(), err)
 	}
 
 	balance, err := uint256.FromHex(serialized.Balance)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid balance value for %s: %w", address.Hex(), err)
 	}
 
 	return &accounts.Account{
@@ -168,10 +177,13 @@ func (r *RedisStateReader) ReadAccountDataForDebug(address libcommon.Address) (*
 
 // ReadAccountStorage reads account storage from Redis
 func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
+	defer cancel()
+	
 	storageKeyStr := storageKey(address, key)
 
 	// Get the most recent storage data before or at current block
-	result := r.client.ZRevRangeByScore(r.ctx, storageKeyStr, &redis.ZRangeBy{
+	result := r.client.ZRevRangeByScore(ctx, storageKeyStr, &redis.ZRangeBy{
 		Min:    "0",
 		Max:    "+inf",
 		Offset: 0,
@@ -179,12 +191,15 @@ func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarna
 	})
 
 	if result.Err() != nil {
-		return nil, result.Err()
+		if result.Err() == redis.Nil {
+			return nil, nil // Storage doesn't exist
+		}
+		return nil, fmt.Errorf("redis error reading storage %s: %w", storageKeyStr, result.Err())
 	}
 
 	values, err := result.Result()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get storage result: %w", err)
 	}
 
 	if len(values) == 0 {
@@ -199,7 +214,7 @@ func (r *RedisStateReader) ReadAccountCode(address libcommon.Address, incarnatio
 	// First get the account to find the code hash
 	account, err := r.ReadAccountData(address)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read account data for code lookup: %w", err)
 	}
 	if account == nil {
 		return nil, nil
@@ -215,16 +230,25 @@ func (r *RedisStateReader) ReadAccountCode(address libcommon.Address, incarnatio
 	}
 
 	// Get the code using the code hash
+	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
+	defer cancel()
+	
 	key := codeKey(account.CodeHash)
-	result := r.client.Get(r.ctx, key)
+	result := r.client.Get(ctx, key)
 	if result.Err() == redis.Nil {
 		return nil, nil
 	}
 	if result.Err() != nil {
-		return nil, result.Err()
+		return nil, fmt.Errorf("failed to get code from redis for hash %s: %w", 
+			account.CodeHash.Hex(), result.Err())
 	}
 
-	return []byte(result.Val()), nil
+	code := result.Val()
+	if len(code) == 0 {
+		return nil, nil // Empty code
+	}
+
+	return []byte(code), nil
 }
 
 // ReadAccountCodeSize reads account code size from Redis
@@ -254,6 +278,9 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 		return errors.New("account cannot be nil")
 	}
 
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+
 	key := accountKey(address)
 	serialized := SerializedAccount{
 		Nonce:       account.Nonce,
@@ -264,28 +291,62 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 
 	data, err := json.Marshal(serialized)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal account data: %w", err)
 	}
 
 	// Store the account with the current block number as score
-	_, err = w.client.ZAdd(w.ctx, key, redis.Z{
+	cmd := w.client.ZAdd(ctx, key, redis.Z{
 		Score:  float64(w.blockNum),
 		Member: string(data),
-	}).Result()
+	})
+	
+	if cmd.Err() != nil {
+		return fmt.Errorf("redis error updating account data for %s: %w", address.Hex(), cmd.Err())
+	}
 
-	return err
+	return nil
 }
 
 // UpdateAccountCode updates account code in Redis
 func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnation uint64, codeHash libcommon.Hash, code []byte) error {
+	// Skip if code is empty
+	if len(code) == 0 {
+		return nil
+	}
+	
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	
 	// Store code by hash (immutable)
 	key := codeKey(codeHash)
-	_, err := w.client.Set(w.ctx, key, code, 0).Result()
-	return err
+	
+	// Check if code already exists - don't need to rewrite if it does
+	existsCmd := w.client.Exists(ctx, key)
+	if existsCmd.Err() != nil {
+		return fmt.Errorf("redis error checking code existence for hash %s: %w", 
+			codeHash.Hex(), existsCmd.Err())
+	}
+	
+	// If code already exists, skip writing it again
+	if existsCmd.Val() > 0 {
+		return nil
+	}
+	
+	// Store code with no expiration (immutable data)
+	setCmd := w.client.Set(ctx, key, code, 0)
+	if setCmd.Err() != nil {
+		return fmt.Errorf("redis error storing code for hash %s: %w", 
+			codeHash.Hex(), setCmd.Err())
+	}
+	
+	return nil
 }
 
 // DeleteAccount deletes an account in Redis
 func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *accounts.Account) error {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	
 	// For deletion, we store an empty account with current block number
 	key := accountKey(address)
 	serialized := SerializedAccount{
@@ -297,20 +358,27 @@ func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *ac
 
 	data, err := json.Marshal(serialized)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal empty account data: %w", err)
 	}
 
 	// Store the deleted account with the current block number as score
-	_, err = w.client.ZAdd(w.ctx, key, redis.Z{
+	cmd := w.client.ZAdd(ctx, key, redis.Z{
 		Score:  float64(w.blockNum),
 		Member: string(data),
-	}).Result()
+	})
+	
+	if cmd.Err() != nil {
+		return fmt.Errorf("redis error deleting account %s: %w", address.Hex(), cmd.Err())
+	}
 
-	return err
+	return nil
 }
 
 // WriteAccountStorage writes account storage to Redis
 func (w *RedisStateWriter) WriteAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash, original, value *uint256.Int) error {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	
 	storageKeyStr := storageKey(address, key)
 
 	// Convert value to bytes
@@ -322,12 +390,17 @@ func (w *RedisStateWriter) WriteAccountStorage(address libcommon.Address, incarn
 	}
 
 	// Store storage with the current block number as score
-	_, err := w.client.ZAdd(w.ctx, storageKeyStr, redis.Z{
+	cmd := w.client.ZAdd(ctx, storageKeyStr, redis.Z{
 		Score:  float64(w.blockNum),
 		Member: string(valueBytes),
-	}).Result()
+	})
+	
+	if cmd.Err() != nil {
+		return fmt.Errorf("redis error writing storage for %s at key %s: %w", 
+			address.Hex(), key.Hex(), cmd.Err())
+	}
 
-	return err
+	return nil
 }
 
 // CreateContract creates a new contract in Redis
@@ -337,7 +410,7 @@ func (w *RedisStateWriter) CreateContract(address libcommon.Address) error {
 	reader := NewRedisStateReader(w.client)
 	account, err := reader.ReadAccountData(address)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read account data for contract creation: %w", err)
 	}
 
 	if account == nil {
@@ -349,9 +422,12 @@ func (w *RedisStateWriter) CreateContract(address libcommon.Address) error {
 			Incarnation: state.FirstContractIncarnation,
 		}
 	} else {
-		// Existing account, increment incarnation
-		account.Incarnation = state.FirstContractIncarnation
-		if account.Incarnation > 0 {
+		// Existing account, set incarnation
+		// If this is the first time it's becoming a contract, use FirstContractIncarnation
+		// Otherwise increment the existing incarnation
+		if account.Incarnation == 0 {
+			account.Incarnation = state.FirstContractIncarnation
+		} else {
 			account.Incarnation++
 		}
 	}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
@@ -199,20 +200,24 @@ type BlockHeaderProcessor struct {
 	redisClient *redis.Client
 	ctx         context.Context
 	logger      log.Logger
+	blockWriter *RedisBlockWriter
 }
 
 // NewBlockHeaderProcessor creates a new BlockHeaderProcessor
 func NewBlockHeaderProcessor(redisClient *redis.Client, logger log.Logger) *BlockHeaderProcessor {
+	ctx, _ := context.WithCancel(context.Background())
+	blockWriter := NewRedisBlockWriterWithLogger(redisClient, logger)
+	
 	return &BlockHeaderProcessor{
 		redisClient: redisClient,
-		ctx:         context.Background(),
+		ctx:         ctx,
 		logger:      logger,
+		blockWriter: blockWriter,
 	}
 }
 
 // ProcessBlockHeader processes a block header and stores it in Redis
 func (p *BlockHeaderProcessor) ProcessBlockHeader(header *types.Header) error {
-	blockWriter := NewRedisBlockWriter(p.redisClient)
 	blockNum := header.Number.Uint64()
 	blockHash := header.Hash()
 
@@ -222,75 +227,162 @@ func (p *BlockHeaderProcessor) ProcessBlockHeader(header *types.Header) error {
 		return fmt.Errorf("failed to marshal header: %w", err)
 	}
 
-	// Write header to Redis
-	if err := blockWriter.WriteBlockHeader(blockNum, blockHash, headerBytes); err != nil {
+	// Write header to Redis using the processor's blockWriter
+	if err := p.blockWriter.WriteBlockHeader(blockNum, blockHash, headerBytes); err != nil {
 		return fmt.Errorf("failed to write block header: %w", err)
 	}
 
+	p.logger.Debug("Processed block header", "number", blockNum, "hash", blockHash.Hex())
 	return nil
 }
 
 // ProcessBlockReceipts processes block receipts and stores them in Redis
 func (p *BlockHeaderProcessor) ProcessBlockReceipts(block *types.Block, receipts types.Receipts) error {
-	blockWriter := NewRedisBlockWriter(p.redisClient)
 	blockNum := block.NumberU64()
+
+	// Track total logs processed
+	totalLogs := 0
 
 	// Process receipts
 	for i, receipt := range receipts {
+		if i >= len(block.Transactions()) {
+			p.logger.Error("Receipt index out of bounds", "receiptIndex", i, "txCount", len(block.Transactions()))
+			continue
+		}
+		
 		txHash := block.Transactions()[i].Hash()
 
 		// Marshal receipt
 		receiptBytes, err := json.Marshal(receipt)
 		if err != nil {
-			return fmt.Errorf("failed to marshal receipt: %w", err)
+			p.logger.Warn("Failed to marshal receipt", "txHash", txHash.Hex(), "err", err)
+			continue // Skip this receipt but try to process others
 		}
 
 		// Write receipt to Redis
-		if err := blockWriter.WriteReceipt(txHash, blockNum, receiptBytes); err != nil {
-			return fmt.Errorf("failed to write receipt: %w", err)
+		if err := p.blockWriter.WriteReceipt(txHash, blockNum, receiptBytes); err != nil {
+			p.logger.Warn("Failed to write receipt", "txHash", txHash.Hex(), "err", err)
+			continue // Skip this receipt but try to process others
 		}
 
 		// Process logs
 		for j, log := range receipt.Logs {
 			logBytes, err := json.Marshal(log)
 			if err != nil {
-				return fmt.Errorf("failed to marshal log: %w", err)
+				p.logger.Warn("Failed to marshal log", "txHash", txHash.Hex(), "logIndex", j, "err", err)
+				continue // Skip this log but try to process others
 			}
 
-			if err := blockWriter.WriteLog(blockNum, uint(j), log.Address, log.Topics, logBytes); err != nil {
-				return fmt.Errorf("failed to write log: %w", err)
+			if err := p.blockWriter.WriteLog(blockNum, uint(j), log.Address, log.Topics, logBytes); err != nil {
+				p.logger.Warn("Failed to write log", "txHash", txHash.Hex(), "logIndex", j, "err", err)
+				continue // Skip this log but try to process others
 			}
+			
+			totalLogs++
 		}
 	}
 
+	p.logger.Debug("Processed block receipts", "blockNum", blockNum, "receiptCount", len(receipts), "logCount", totalLogs)
 	return nil
 }
 
 // HandleBlock processes a block and writes its data to Redis
 func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Receipts) error {
-	// Process header
+	blockNum := block.NumberU64()
+	blockHash := block.Hash()
+	
+	// Process header with better error handling
 	if err := p.ProcessBlockHeader(block.Header()); err != nil {
-		return err
+		p.logger.Error("Failed to process block header for Redis", "block", blockNum, "err", err)
+		return fmt.Errorf("failed to process header for block %d: %w", blockNum, err)
 	}
-
+	
+	// Process transactions - this was missing
+	for _, tx := range block.Transactions() {
+		txData, err := json.Marshal(tx)
+		if err != nil {
+			p.logger.Warn("Failed to marshal transaction", "txHash", tx.Hash().Hex(), "err", err)
+			continue
+		}
+		
+		if err := p.WriteTransaction(tx.Hash(), blockNum, txData); err != nil {
+			p.logger.Warn("Failed to write transaction to Redis", "txHash", tx.Hash().Hex(), "err", err)
+			// Continue despite errors
+		}
+	}
+	
 	// Process receipts
 	if err := p.ProcessBlockReceipts(block, receipts); err != nil {
-		return err
+		p.logger.Error("Failed to process block receipts for Redis", "block", blockNum, "err", err)
+		return fmt.Errorf("failed to process receipts for block %d: %w", blockNum, err)
 	}
-
-	p.logger.Info("Block processed and written to Redis", "block", block.NumberU64(), "hash", block.Hash().Hex())
+	
+	// Store a compact block representation for quick access
+	blockSummary := map[string]interface{}{
+		"hash":            blockHash.Hex(),
+		"number":          blockNum,
+		"timestamp":       block.Time(),
+		"txCount":         len(block.Transactions()),
+		"gasUsed":         block.GasUsed(),
+		"gasLimit":        block.GasLimit(),
+		"parentHash":      block.ParentHash().Hex(),
+		"stateRoot":       block.Root().Hex(),
+		"receiptsRoot":    block.ReceiptHash().Hex(),
+		"transactionsRoot": block.TxHash().Hex(),
+	}
+	
+	blockSummaryData, err := json.Marshal(blockSummary)
+	if err == nil {
+		// Using context with timeout
+		ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+		defer cancel()
+		
+		// Store block summary
+		blockSummaryKey := fmt.Sprintf("block:%d:summary", blockNum)
+		if err := p.redisClient.Set(ctx, blockSummaryKey, blockSummaryData, 0).Err(); err != nil {
+			p.logger.Warn("Failed to store block summary", "block", blockNum, "err", err)
+		}
+	}
+	
+	p.logger.Info("Block processed and written to Redis", "block", blockNum, "hash", blockHash.Hex(), 
+		"txCount", len(block.Transactions()), "receiptCount", len(receipts))
 	return nil
 }
 
 // WriteTransaction stores a transaction in Redis (for pending transactions)
 func (p *BlockHeaderProcessor) WriteTransaction(txHash libcommon.Hash, blockNum uint64, txData []byte) error {
-	key := fmt.Sprintf("tx:%s", txHash.Hex())
+	// Use a context with timeout
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
 	
-	// Store tx with block number as score (0 for pending)
-	_, err := p.redisClient.ZAdd(p.ctx, key, redis.Z{
+	txKey := fmt.Sprintf("tx:%s", txHash.Hex())
+	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
+	
+	// Use pipeline for better performance
+	pipe := p.redisClient.Pipeline()
+	
+	// Store tx with block number as score
+	pipe.ZAdd(ctx, txKey, redis.Z{
 		Score:  float64(blockNum),
 		Member: string(txData),
-	}).Result()
+	})
 	
-	return err
+	// Also add tx hash to block's transaction set
+	pipe.SAdd(ctx, blockTxsKey, txHash.Hex())
+	
+	// Execute pipeline
+	cmds, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to write transaction to Redis: %w", err)
+	}
+	
+	// Check individual command errors
+	for i, cmd := range cmds {
+		if cmd.Err() != nil {
+			p.logger.Warn("Error in Redis transaction command", "index", i, "err", cmd.Err())
+			// Continue despite errors to maintain some data
+		}
+	}
+	
+	return nil
 }

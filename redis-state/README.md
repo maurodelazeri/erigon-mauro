@@ -247,6 +247,28 @@ The Redis state system logs useful information for monitoring:
 
 Use standard Redis monitoring tools like `redis-cli info` to track memory usage and operation counts.
 
+## Recent Improvements
+
+The Redis state implementation has been recently enhanced with the following improvements:
+
+### Performance Optimizations
+- Added context timeouts to all Redis operations to prevent hanging
+- Implemented Redis pipelines for batching operations and reducing network roundtrips
+- Added optimization for code storage to avoid redundant writes for immutable data
+- Improved indexing of logs for more efficient filtering by address and topics
+
+### Reliability Enhancements
+- Added comprehensive error handling with proper error propagation
+- Improved error logging with context-specific messages
+- Implemented fallback mechanism to continue operation despite Redis failures
+- Added optional expiration for certain indices to manage memory usage
+
+### Data Model Improvements
+- Enhanced the block transactions indexing for faster retrieval
+- Added block summary data for quick access to critical block information
+- Improved logging organization with block+address+topic composite keys
+- Implemented more efficient transaction storage pattern
+
 ## Contributing
 
 Contributions to the Redis state implementation are welcome! Please follow the Erigon project's contribution guidelines.
