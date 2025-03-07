@@ -39,6 +39,7 @@ import (
 	state2 "github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon-lib/wrap"
+
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/rawdb"
 	"github.com/erigontech/erigon/core/rawdb/rawdbhelpers"
@@ -306,6 +307,19 @@ func ExecV3(ctx context.Context,
 		accumulator = cfg.notifications.Accumulator
 		if accumulator == nil {
 			accumulator = shards.NewAccumulator()
+		}
+
+		// Wrap with Redis accumulator if Redis is enabled
+		if cfg.redisEnabled && cfg.redisIntegration != nil && cfg.redisIntegration.IsEnabled() {
+			if wrappedAccumulator := cfg.redisIntegration.WrapAccumulator(accumulator, blockNum); wrappedAccumulator != nil {
+				// Type assertion to check if the wrapped object is a *shards.Accumulator
+				if redisAcc, ok := wrappedAccumulator.(*shards.Accumulator); ok {
+					accumulator = redisAcc
+					logger.Info("Using Redis accumulator for state mirroring", "block", blockNum)
+				} else {
+					logger.Warn("Failed to wrap accumulator with Redis accumulator, using standard accumulator", "block", blockNum)
+				}
+			}
 		}
 	}
 	rs := state.NewStateV3(doms, logger)
@@ -724,6 +738,28 @@ Loop:
 			_, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), executor.tx(), executor.domains(), cfg, execStage, stageProgress, parallel, logger, u, inMemExec)
 			if err != nil {
 				return err
+			}
+
+			// Process block header and receipts in Redis if enabled
+			if cfg.redisEnabled && cfg.redisIntegration != nil && cfg.redisIntegration.IsEnabled() {
+				blockWriter := cfg.redisIntegration.GetBlockWriter()
+				if blockWriter != nil {
+					// Get receipts for this block
+					var receipts types.Receipts
+					if err := cfg.db.View(ctx, func(tx kv.Tx) error {
+						receipts = rawdb.ReadRawReceipts(tx, blockNum)
+						return nil
+					}); err != nil {
+						logger.Warn("Failed to read receipts for Redis processing", "block", blockNum, "err", err)
+					} else if len(receipts) > 0 {
+						// Handle block in Redis
+						if err := blockWriter.HandleBlock(b, receipts); err != nil {
+							logger.Warn("Failed to process block for Redis", "block", blockNum, "err", err)
+						} else {
+							logger.Info("Block processed for Redis", "block", blockNum, "txs", len(receipts), "hash", b.Hash())
+						}
+					}
+				}
 			}
 		} else {
 			fmt.Printf("[dbg] mmmm... do we need action here????\n")

@@ -257,6 +257,13 @@ type Config struct {
 	SilkwormRpcLogMaxFiles       uint16
 	SilkwormRpcLogDumpResponse   bool
 	SilkwormRpcNumWorkers        uint32
+	
+	// Redis state mirroring configuration
+	RedisEnabled     bool
+	RedisURL         string
+	RedisPassword    string
+	RedisPoolSize    int
+	RedisMaxRetries  int
 	SilkwormRpcJsonCompatibility bool
 
 	// PoS Single Slot finality

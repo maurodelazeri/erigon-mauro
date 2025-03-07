@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/cmd/state/exec3"
+	redisstate "github.com/erigontech/erigon/redis-state"
 
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
@@ -90,6 +92,11 @@ type ExecuteBlockCfg struct {
 	blockProduction bool
 
 	applyWorker, applyWorkerMining *exec3.Worker
+	
+	// Redis state mirroring
+	redisEnabled   bool
+	redisClient    *redis.Client
+	redisIntegration *redisstate.RedisIntegration
 }
 
 func StageExecuteBlocksCfg(
@@ -109,6 +116,9 @@ func StageExecuteBlocksCfg(
 	genesis *types.Genesis,
 	syncCfg ethconfig.Sync,
 	silkworm *silkworm.Silkworm,
+	redisEnabled bool,
+	redisClient *redis.Client,
+	redisIntegration *redisstate.RedisIntegration,
 ) ExecuteBlockCfg {
 	if dirs.SnapDomain == "" {
 		panic("empty `dirs` variable")
@@ -133,6 +143,9 @@ func StageExecuteBlocksCfg(
 		silkworm:          silkworm,
 		applyWorker:       exec3.NewWorker(nil, log.Root(), context.Background(), false, db, nil, blockReader, chainConfig, genesis, nil, engine, dirs, false),
 		applyWorkerMining: exec3.NewWorker(nil, log.Root(), context.Background(), false, db, nil, blockReader, chainConfig, genesis, nil, engine, dirs, true),
+		redisEnabled:      redisEnabled,
+		redisClient:       redisClient,
+		redisIntegration:  redisIntegration,
 	}
 }
 

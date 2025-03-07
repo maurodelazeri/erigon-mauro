@@ -265,3 +265,32 @@ func (p *BlockHeaderProcessor) ProcessBlockReceipts(block *types.Block, receipts
 
 	return nil
 }
+
+// HandleBlock processes a block and writes its data to Redis
+func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Receipts) error {
+	// Process header
+	if err := p.ProcessBlockHeader(block.Header()); err != nil {
+		return err
+	}
+
+	// Process receipts
+	if err := p.ProcessBlockReceipts(block, receipts); err != nil {
+		return err
+	}
+
+	p.logger.Info("Block processed and written to Redis", "block", block.NumberU64(), "hash", block.Hash().Hex())
+	return nil
+}
+
+// WriteTransaction stores a transaction in Redis (for pending transactions)
+func (p *BlockHeaderProcessor) WriteTransaction(txHash libcommon.Hash, blockNum uint64, txData []byte) error {
+	key := fmt.Sprintf("tx:%s", txHash.Hex())
+	
+	// Store tx with block number as score (0 for pending)
+	_, err := p.redisClient.ZAdd(p.ctx, key, redis.Z{
+		Score:  float64(blockNum),
+		Member: string(txData),
+	}).Result()
+	
+	return err
+}

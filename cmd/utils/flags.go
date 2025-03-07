@@ -505,6 +505,31 @@ var (
 		Usage: "Amount of data to store in StateCache (enabled if no --datadir set). Set 0 to disable StateCache. Defaults to 0MB",
 	}
 
+	// Redis state flags
+	RedisEnabledFlag = cli.BoolFlag{
+		Name:  "redis.enabled",
+		Usage: "Enable Redis state mirroring for O(1) historical state access",
+	}
+	RedisURLFlag = cli.StringFlag{
+		Name:  "redis.url",
+		Usage: "Redis connection URL (e.g., redis://localhost:6379/0)",
+		Value: "redis://localhost:6379/0",
+	}
+	RedisPasswordFlag = cli.StringFlag{
+		Name:  "redis.password",
+		Usage: "Redis password",
+	}
+	RedisPoolSizeFlag = cli.IntFlag{
+		Name:  "redis.poolsize",
+		Usage: "Redis connection pool size",
+		Value: 10,
+	}
+	RedisMaxRetriesFlag = cli.IntFlag{
+		Name:  "redis.maxretries",
+		Usage: "Redis maximum retries",
+		Value: 3,
+	}
+
 	// Network Settings
 	MaxPeersFlag = cli.IntFlag{
 		Name:  "maxpeers",
@@ -2019,6 +2044,13 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 		libkzg.SetTrustedSetupFilePath(ctx.String(TrustedSetupFile.Name))
 	}
 
+	// Redis state mirroring configuration
+	cfg.RedisEnabled = ctx.Bool(RedisEnabledFlag.Name)
+	cfg.RedisURL = ctx.String(RedisURLFlag.Name)
+	cfg.RedisPassword = ctx.String(RedisPasswordFlag.Name)
+	cfg.RedisPoolSize = ctx.Int(RedisPoolSizeFlag.Name)
+	cfg.RedisMaxRetries = ctx.Int(RedisMaxRetriesFlag.Name)
+	
 	// Do this after chain config as there are chain type registration
 	// dependencies for know config which need to be set-up
 	if cfg.Snapshot.DownloaderAddr == "" {

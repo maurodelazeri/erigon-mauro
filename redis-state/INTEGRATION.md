@@ -1,252 +1,126 @@
 # Redis State Integration Guide
 
-This guide provides specific, concrete steps to integrate the Redis state solution with an Erigon node. The goal is to **keep the Erigon node working normally** while adding interceptors at key points to mirror state changes to Redis.
+This guide provides instructions on how to use the Redis state mirroring solution with Erigon. The integration is designed to **keep Erigon working normally** while adding interceptors at key points to mirror state changes to Redis.
 
 ## Overview
 
-The integration requires changes in just three specific locations in Erigon's codebase:
+The Redis state mirroring solution provides:
 
-1. **State Writer Interception**: Wrap the state writer during block execution to mirror state changes
-2. **Block Processing Interception**: Add Redis mirroring after a block is successfully processed
-3. **Initial Setup**: Configure Redis connection and initializing components
+1. **O(1) Historical State Access**: Access any account, storage, or code at any block height in constant time
+2. **Non-Intrusive Integration**: Keeps Erigon working normally, with Redis mirroring as an optional layer
+3. **Real-Time State Mirroring**: Captures state changes as they happen during block execution
 
-## Step 1: Configure Redis Client in Node Setup
+## Configuration
 
-First, we need to add Redis configuration to the Erigon node. Open `/cmd/erigon/main.go` and add Redis-related flags and setup:
+To enable Redis state mirroring, use the following command-line flags:
 
-```go
-// Add these imports
-import (
-    "github.com/redis/go-redis/v9"
-    redisstate "github.com/erigontech/erigon/redis-state"
-)
-
-// Add these as command-line flags
-var (
-    // Existing flags
-    
-    // Redis flags for state mirroring
-    redisURLFlag = flag.String("redis.url", "", "Redis URL for state mirroring (empty to disable)")
-    redisPasswordFlag = flag.String("redis.password", "", "Redis password for state mirroring")
-)
-
-// Then in the main() function, add Redis client setup:
-func main() {
-    // Existing initialization code
-    
-    // Initialize Redis client if URL is provided
-    var redisClient *redis.Client
-    var blockProcessor *redisstate.BlockHeaderProcessor
-    
-    if *redisURLFlag != "" {
-        opts, err := redis.ParseURL(*redisURLFlag)
-        if err != nil {
-            utils.Fatalf("Failed to parse Redis URL: %v", err)
-        }
-        
-        if *redisPasswordFlag != "" {
-            opts.Password = *redisPasswordFlag
-        }
-        
-        redisClient = redis.NewClient(opts)
-        ctx := context.Background()
-        
-        // Test Redis connection
-        if err := redisClient.Ping(ctx).Err(); err != nil {
-            utils.Fatalf("Failed to connect to Redis: %v", err)
-        }
-        
-        log.Info("Connected to Redis for state mirroring", "url", *redisURLFlag)
-        
-        // Create a block processor for header and receipt processing
-        blockProcessor = redisstate.NewBlockHeaderProcessor(redisClient, log.New())
-    }
-    
-    // Continue with normal Erigon initialization, but pass redisClient to the relevant components
-}
+```
+--redis.enabled            Enable Redis state mirroring for O(1) historical state access
+--redis.url                Redis connection URL (default: "redis://localhost:6379/0")
+--redis.password           Redis password (optional)
+--redis.poolsize           Redis connection pool size (default: 10)
+--redis.maxretries         Redis maximum retries (default: 3)
 ```
 
-## Step 2: Intercept State Changes During Block Execution
-
-The key point for state interception is in Erigon's block execution stage. Open `/core/state_processor.go` and locate the `ApplyTransaction` function. We need to wrap the state writer:
-
-```go
-// Find this function
-func ApplyTransaction(config *chain.Config, bc ChainContext, author *libcommon.Address, gp *GasPool, ibs evmtypes.IntraBlockState, stateWriter state.StateWriter, header *types.Header, tx types.Transaction, usedGas *uint64, evm *vm.EVM, cfg vm.Config) (*types.Receipt, error) {
-    // Modify the function to accept redisClient parameter
-}
-
-// In your main execution loop inside stages/execution.go, find where ApplyTransaction is called
-
-// Inside this function
-func executeBlock(/* existing params */, redisClient *redis.Client) error {
-    
-    // Find where the state writer is created, typically something like:
-    stateWriter := state.NewStateWriter(batch, blockNum)
-    
-    // Wrap it with our interceptor
-    var wrappedStateWriter state.StateWriter
-    if redisClient != nil {
-        wrappedStateWriter = redisstate.NewHistoricalStateInterceptor(stateWriter, redisClient, blockNum, logger)
-    } else {
-        wrappedStateWriter = stateWriter
-    }
-    
-    // Use wrappedStateWriter instead of stateWriter for subsequent operations
-    
-    // When ApplyTransaction is called, use the wrapped writer
-    receipt, err := ApplyTransaction(/* existing params with wrappedStateWriter */)
-    
-    // Continue with normal execution
-}
+Example:
+```
+./build/bin/erigon --redis.enabled --redis.url="redis://localhost:6379/0"
 ```
 
-## Step 3: Process Block Headers and Receipts
+## Implementation Details
 
-After a block is successfully executed, we need to store the block header and receipts in Redis. In `/eth/backend.go`, find the block insertion method:
+The Redis state mirroring solution works by:
 
-```go
-// Find a function like this
-func (s *EthBackend) InsertBlock(block *types.Block, receipts types.Receipts) error {
-    // Existing block processing code
-    
-    // After the block is successfully committed, mirror to Redis if enabled
-    if redisClient != nil && blockProcessor != nil {
-        if err := blockProcessor.ProcessBlockHeader(block.Header()); err != nil {
-            log.Warn("Failed to mirror block header to Redis", "err", err, "block", block.NumberU64())
-            // Don't return error - we continue even if Redis mirroring fails
-        }
-        
-        if err := blockProcessor.ProcessBlockReceipts(block, receipts); err != nil {
-            log.Warn("Failed to mirror block receipts to Redis", "err", err, "block", block.NumberU64())
-            // Don't return error - we continue even if Redis mirroring fails
-        }
-    }
-    
-    // Continue with normal processing
-    return nil
-}
+1. **State Writer Interception**: Wrapping the state accumulator during block execution to capture state changes
+2. **Block Processing**: Mirroring block headers and receipts to Redis after a block is successfully processed
+3. **Graceful Degradation**: Continuing normal Erigon operation even if Redis becomes unavailable
+
+## Data Model
+
+The Redis state implementation uses the following key patterns:
+
+- `account:{address}`: Sorted set of account states by block number
+- `storage:{address}:{key}`: Sorted set of storage values by block number
+- `code:{codeHash}`: Contract bytecode
+- `block:{blockNum}`: Hash map of block data
+- `blockHash:{blockHash}`: Mapping from block hash to block number
+- `receipt:{txHash}`: Sorted set of transaction receipts by block number
+- `logs:{blockNum}:{logIndex}`: Log entries
+- `address:{address}`: Sorted set of log keys by block number for an address
+- `topic:{topic}`: Sorted set of log keys by block number for a topic
+- `currentBlock`: Latest block number
+
+## Performance Considerations
+
+- Redis memory usage scales with the size of the state and the number of historical changes
+- For large-scale deployments, consider Redis Cluster for horizontal scaling
+- Consider using Redis persistence options like RDB or AOF for data durability
+- Use connection pooling to handle concurrent state access efficiently
+
+## Architecture
+
+```
+┌────────────────┐      ┌───────────────┐      ┌────────────────┐
+│                │      │               │      │                │
+│  Erigon Node   │◄────►│ Redis State   │◄────►│  Redis Server  │
+│                │      │ Integration   │      │                │
+└────────────────┘      └───────────────┘      └────────────────┘
+                               ▲
+                               │
+                               ▼
+                        ┌────────────────┐
+                        │                │
+                        │  API Clients   │
+                        │                │
+                        └────────────────┘
 ```
 
-## Complete Integration Example
+## Function Call Flow for State Retrieval
 
-Here's a more complete example showing how to integrate at all key points. This example assumes you've added the Redis client setup from Step 1.
-
-### Integration in Staged Sync
-
-The primary integration point for Erigon is in the staged sync process, specifically in the execution stage:
-
-```go
-// In stages/stage_execute.go
-
-// Add this import
-import (
-    redisstate "github.com/erigontech/erigon/redis-state"
-)
-
-// Modify ExecCfg to include Redis
-type ExecCfg struct {
-    // Existing fields
-    redisClient *redis.Client
-    // Other fields
-}
-
-// Modify ExecuteBlocksStage to use Redis
-func ExecuteBlocksStage(/* existing params */, cfg *ExecCfg) error {
-    // Existing code
-    
-    // Inside the execution loop for each block
-    for blockNum := from; blockNum <= to; blockNum++ {
-        // Find where the state writer is created
-        stateWriter, err := state.NewStateWriter(batch, blockNum)
-        if err != nil {
-            return err
-        }
-        
-        // Wrap with Redis interceptor if Redis is enabled
-        var wrappedStateWriter state.StateWriter
-        if cfg.redisClient != nil {
-            wrappedStateWriter = redisstate.NewHistoricalStateInterceptor(stateWriter, cfg.redisClient, blockNum, logger)
-        } else {
-            wrappedStateWriter = stateWriter
-        }
-        
-        // Use wrappedStateWriter in subsequent code
-        
-        // After successful block execution, process header and receipts
-        if cfg.redisClient != nil {
-            blockProcessor := redisstate.NewBlockHeaderProcessor(cfg.redisClient, logger)
-            
-            if err := blockProcessor.ProcessBlockHeader(header); err != nil {
-                logger.Warn("Failed to mirror block header to Redis", "err", err, "block", blockNum)
-                // Don't return error - continue even if Redis mirroring fails
-            }
-            
-            if err := blockProcessor.ProcessBlockReceipts(block, receipts); err != nil {
-                logger.Warn("Failed to mirror block receipts to Redis", "err", err, "block", blockNum)
-                // Don't return error - continue even if Redis mirroring fails
-            }
-        }
-    }
-    
-    // Rest of the function
-}
+```
+Client Request
+   │
+   ▼
+StateAtBlock(blockNumber)
+   │
+   ▼
+PointInTimeRedisStateReader
+   │
+   ▼
+ZRevRangeByScore(key, 0, blockNumber)
+   │
+   ▼
+Process and return result
 ```
 
-### Integration in Transaction Processing
+## Troubleshooting
 
-For real-time transaction mirroring, integrate in the transaction pool:
+Common issues:
 
-```go
-// In txpool/tx_pool.go
+- **Connection refused**: Ensure Redis server is running and accessible
+- **Timeouts during operation**: For high-load systems, consider increasing Redis connection pool size
+- **Memory usage**: Monitor Redis memory usage and consider tuning maxmemory settings
+- **Performance degradation**: Check Redis persistence settings, consider disabling AOF for better performance
 
-// Modify add transaction method
-func (pool *TxPool) addTx(tx *types.Transaction, local bool, redisClient *redis.Client) error {
-    // Existing code
-    
-    // After the transaction is successfully added
-    if redisClient != nil {
-        blockWriter := redisstate.NewRedisBlockWriter(redisClient)
-        
-        // Store the transaction with its hash (not committed to a block yet)
-        txHash := tx.Hash()
-        txJson, _ := json.Marshal(tx)
-        if err := blockWriter.WriteTransaction(txHash, 0, txJson); err != nil {
-            // Log but continue
-            pool.logger.Warn("Failed to mirror transaction to Redis", "err", err, "txHash", txHash.Hex())
-        }
-    }
-    
-    // Continue with normal processing
-}
-```
+Use standard Redis monitoring tools like `redis-cli info` to track memory usage and operation counts.
 
-## Practical Integration Steps
+## Implementation Details
 
-To integrate Redis state mirroring into your Erigon node:
+The Redis integration intercepts three key points in Erigon:
 
-1. **Ensure Redis-State Module is Built**:
-   ```bash
-   go build -o ./build/bin/redis-state ./cmd/redis-state
-   ```
+1. During the initialization of Erigon in the `New` function in `eth/backend.go`, where we:
+   - Create a Redis client based on configuration flags
+   - Initialize the Redis integration
 
-2. **Add Redis Integration Code to Erigon**:
-   - Add the code examples shown above to the appropriate files
-   - Make sure to pass Redis client to all necessary components
+2. During block execution in the `ExecV3` function in `eth/stagedsync/exec3.go`, where we:
+   - Wrap the state accumulator to capture all state changes and mirror them to Redis
+   - This allows capturing all account, storage, and code changes in real-time
 
-3. **Update Erigon Command-Line Flags**:
-   - Add Redis URL and password flags as shown
-   - Document this in the Erigon help output
+3. After block execution in the same file, where we:
+   - Process the block header and receipts 
+   - Store them in Redis for efficient retrieval
 
-4. **Rebuild Erigon**:
-   ```bash
-   go build -o ./build/bin/erigon ./cmd/erigon
-   ```
-
-5. **Run Erigon with Redis Enabled**:
-   ```bash
-   ./build/bin/erigon --redis.url="redis://localhost:6379/0" [other flags]
-   ```
+All Redis operations are designed to fail gracefully, allowing Erigon to continue operating normally even if Redis becomes unavailable.
 
 ## Fallback Handling
 

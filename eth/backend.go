@@ -45,6 +45,8 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	redisstate "github.com/erigontech/erigon/redis-state"
+
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/chain/networkname"
 	"github.com/erigontech/erigon-lib/chain/snapcfg"
@@ -174,6 +176,9 @@ type Ethereum struct {
 	rpcFilters          *rpchelper.Filters
 	rpcDaemonStateCache kvcache.Cache
 
+	// Redis state mirroring
+	redisIntegration *redisstate.RedisIntegration
+
 	miningSealingQuit   chan struct{}
 	pendingBlocks       chan *types.Block
 	minedBlocks         chan *types.Block
@@ -248,6 +253,27 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	}
 	dirs := stack.Config().Dirs
 
+	// Initialize Redis integration if enabled
+	var redisIntegration *redisstate.RedisIntegration
+	if config.RedisEnabled {
+		logger.Info("Redis state mirroring enabled", "url", config.RedisURL)
+		redisCfg := redisstate.Config{
+			Enabled:    config.RedisEnabled,
+			RedisURL:   config.RedisURL,
+			RedisPass:  config.RedisPassword,
+			PoolSize:   config.RedisPoolSize,
+			MaxRetries: config.RedisMaxRetries,
+			LogLevel:   "info",
+		}
+		var err error
+		redisIntegration, err = redisstate.NewRedisIntegration(redisCfg, logger)
+		if err != nil {
+			logger.Error("Failed to initialize Redis integration", "err", err)
+			return nil, fmt.Errorf("failed to initialize Redis integration: %w", err)
+		}
+		logger.Info("Redis state mirroring initialized")
+	}
+
 	tmpdir := dirs.Tmp
 	if err := RemoveContents(tmpdir); err != nil { // clean it on startup
 		return nil, fmt.Errorf("clean tmp dir: %s, %w", tmpdir, err)
@@ -290,6 +316,7 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 		miningSealingQuit:         make(chan struct{}),
 		minedBlocks:               make(chan *types.Block, 1),
 		minedBlockObservers:       event.NewObservers[*types.Block](),
+		redisIntegration:          redisIntegration,
 		logger:                    logger,
 		stopNode: func() error {
 			return stack.Close()
@@ -801,6 +828,9 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 				config.Genesis,
 				config.Sync,
 				stages2.SilkwormForExecutionStage(backend.silkworm, config),
+				config.RedisEnabled,
+				nil,
+				backend.redisIntegration,
 			),
 			stagedsync.StageSendersCfg(backend.chainDB, chainConfig, config.Sync, false, dirs.Tmp, config.Prune, blockReader, backend.sentriesClient.Hd),
 			stagedsync.StageMiningExecCfg(backend.chainDB, miner, backend.notifications.Events, *backend.chainConfig, backend.engine, &vm.Config{}, tmpdir, nil, 0, txnProvider, blockReader),
@@ -848,6 +878,9 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 					config.Genesis,
 					config.Sync,
 					stages2.SilkwormForExecutionStage(backend.silkworm, config),
+					config.RedisEnabled,
+					nil,
+					backend.redisIntegration,
 				),
 				stagedsync.StageSendersCfg(backend.chainDB, chainConfig, config.Sync, false, dirs.Tmp, config.Prune, blockReader, backend.sentriesClient.Hd),
 				stagedsync.StageMiningExecCfg(backend.chainDB, miningStatePos, backend.notifications.Events, *backend.chainConfig, backend.engine, &vm.Config{}, tmpdir, interrupt, param.PayloadId, txnProvider, blockReader),
@@ -1733,6 +1766,15 @@ func (s *Ethereum) Stop() error {
 	if s.silkworm != nil {
 		if err := s.silkworm.Close(); err != nil {
 			s.logger.Error("silkworm.Close error", "err", err)
+		}
+	}
+
+	// Close Redis integration if enabled
+	if s.redisIntegration != nil {
+		if err := s.redisIntegration.Close(); err != nil {
+			s.logger.Error("Redis integration close error", "err", err)
+		} else {
+			s.logger.Info("Redis integration closed")
 		}
 	}
 
