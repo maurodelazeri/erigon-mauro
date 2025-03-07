@@ -18,6 +18,7 @@ package redisstate
 
 import (
 	"context"
+	"sync"
 
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
@@ -36,29 +37,45 @@ type RedisAccumulator struct {
 	redisWriter *RedisStateWriter
 	logger      log.Logger
 	ctx         context.Context
+	mu          sync.RWMutex // Protect against concurrent access
 }
 
 // NewRedisAccumulator creates a new RedisAccumulator
 func NewRedisAccumulator(accumulator *shards.Accumulator, redisClient *redis.Client, blockNum uint64, logger log.Logger) *RedisAccumulator {
+	ctx, _ := context.WithCancel(context.Background())
+	
 	return &RedisAccumulator{
 		Accumulator: accumulator,
 		redisClient: redisClient,
-		redisWriter: NewRedisStateWriter(redisClient, blockNum),
+		redisWriter: NewRedisStateWriterWithLogger(redisClient, blockNum, logger),
 		logger:      logger,
-		ctx:         context.Background(),
+		ctx:         ctx,
 	}
 }
 
 // ChangeAccount overrides the accumulator's ChangeAccount method
 func (ra *RedisAccumulator) ChangeAccount(address libcommon.Address, incarnation uint64, data []byte) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	
 	// Call original method
 	ra.Accumulator.ChangeAccount(address, incarnation, data)
 
 	// Mirror to Redis
 	var acc accounts.Account
 	if err := accounts.DeserialiseV3(&acc, data); err == nil {
-		if err := ra.redisWriter.UpdateAccountData(address, nil, &acc); err != nil {
-			ra.logger.Error("Failed to write account to Redis", "address", address, "err", err)
+		// Create a reader to get the original account data if available
+		reader := NewRedisStateReaderWithLogger(ra.redisClient, ra.logger)
+		original, err := reader.ReadAccountData(address)
+		if err != nil {
+			ra.logger.Debug("Could not read original account data, creating new", "address", address, "err", err)
+			// Continue with nil original, not a critical error
+		}
+		
+		if err := ra.redisWriter.UpdateAccountData(address, original, &acc); err != nil {
+			ra.logger.Error("Failed to write account to Redis", "address", address, "block", ra.redisWriter.blockNum, "err", err)
+		} else {
+			ra.logger.Debug("Account updated in Redis", "address", address, "block", ra.redisWriter.blockNum)
 		}
 	} else {
 		ra.logger.Error("Failed to deserialize account", "address", address, "err", err)
@@ -67,6 +84,9 @@ func (ra *RedisAccumulator) ChangeAccount(address libcommon.Address, incarnation
 
 // ChangeStorage overrides the accumulator's ChangeStorage method
 func (ra *RedisAccumulator) ChangeStorage(address libcommon.Address, incarnation uint64, location libcommon.Hash, data []byte) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	
 	// Call original method
 	ra.Accumulator.ChangeStorage(address, incarnation, location, data)
 
@@ -76,32 +96,86 @@ func (ra *RedisAccumulator) ChangeStorage(address libcommon.Address, incarnation
 		value.SetBytes(data)
 	}
 
-	if err := ra.redisWriter.WriteAccountStorage(address, incarnation, &location, nil, value); err != nil {
-		ra.logger.Error("Failed to write storage to Redis", "address", address, "location", location, "err", err)
+	// Get original value if available
+	reader := NewRedisStateReaderWithLogger(ra.redisClient, ra.logger)
+	storageData, err := reader.ReadAccountStorage(address, incarnation, &location)
+	var originalValue *uint256.Int
+	if err == nil && len(storageData) > 0 {
+		originalValue = uint256.NewInt(0).SetBytes(storageData)
+	}
+
+	if err := ra.redisWriter.WriteAccountStorage(address, incarnation, &location, originalValue, value); err != nil {
+		ra.logger.Error("Failed to write storage to Redis", 
+			"address", address, 
+			"location", location.Hex(), 
+			"block", ra.redisWriter.blockNum,
+			"err", err)
+	} else {
+		ra.logger.Debug("Storage updated in Redis", 
+			"address", address, 
+			"location", location.Hex(), 
+			"block", ra.redisWriter.blockNum)
 	}
 }
 
 // ChangeCode overrides the accumulator's ChangeCode method
 func (ra *RedisAccumulator) ChangeCode(address libcommon.Address, incarnation uint64, code []byte) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	
 	// Call original method
 	ra.Accumulator.ChangeCode(address, incarnation, code)
+
+	// Skip empty code
+	if len(code) == 0 {
+		return
+	}
 
 	// Calculate code hash
 	codeHash := libcommon.BytesToHash(crypto.Keccak256(code))
 
 	// Mirror to Redis
 	if err := ra.redisWriter.UpdateAccountCode(address, incarnation, codeHash, code); err != nil {
-		ra.logger.Error("Failed to write code to Redis", "address", address, "err", err)
+		ra.logger.Error("Failed to write code to Redis", 
+			"address", address, 
+			"codeHash", codeHash.Hex(), 
+			"codeSize", len(code), 
+			"block", ra.redisWriter.blockNum,
+			"err", err)
+	} else {
+		ra.logger.Debug("Code updated in Redis", 
+			"address", address, 
+			"codeHash", codeHash.Hex(), 
+			"codeSize", len(code), 
+			"block", ra.redisWriter.blockNum)
 	}
 }
 
 // DeleteAccount overrides the accumulator's DeleteAccount method
 func (ra *RedisAccumulator) DeleteAccount(address libcommon.Address) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	
+	// Get the original account before deletion if possible
+	reader := NewRedisStateReaderWithLogger(ra.redisClient, ra.logger)
+	original, err := reader.ReadAccountData(address)
+	if err != nil {
+		ra.logger.Debug("Could not read original account before deletion", "address", address, "err", err)
+		// Continue with nil original, not a critical error
+	}
+	
 	// Call original method
 	ra.Accumulator.DeleteAccount(address)
 
-	// Mirror to Redis - we need to handle original account param being nil
-	if err := ra.redisWriter.DeleteAccount(address, nil); err != nil {
-		ra.logger.Error("Failed to delete account in Redis", "address", address, "err", err)
+	// Mirror to Redis with the original account data
+	if err := ra.redisWriter.DeleteAccount(address, original); err != nil {
+		ra.logger.Error("Failed to delete account in Redis", 
+			"address", address, 
+			"block", ra.redisWriter.blockNum,
+			"err", err)
+	} else {
+		ra.logger.Debug("Account deleted in Redis", 
+			"address", address, 
+			"block", ra.redisWriter.blockNum)
 	}
 }

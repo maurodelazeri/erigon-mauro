@@ -21,26 +21,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
 
 	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core/state"
 )
 
 // RedisStateReader implements the state.StateReader interface using Redis as the backing store
 type RedisStateReader struct {
-	client *redis.Client
-	ctx    context.Context
+	client   *redis.Client
+	ctx      context.Context
+	logger   log.Logger
+	blockNum uint64  // For point-in-time queries, 0 means latest
 }
 
 // RedisStateWriter implements the state.StateWriter interface using Redis as the backing store
 type RedisStateWriter struct {
 	client   *redis.Client
 	ctx      context.Context
+	logger   log.Logger
 	blockNum uint64
 	txNum    uint64
 }
@@ -62,8 +67,32 @@ type SerializedAccount struct {
 func NewRedisStateReader(client *redis.Client) *RedisStateReader {
 	ctx, _ := context.WithCancel(context.Background())
 	return &RedisStateReader{
-		client: client,
-		ctx:    ctx,
+		client:   client,
+		ctx:      ctx,
+		logger:   log.Root(),
+		blockNum: 0, // 0 means latest
+	}
+}
+
+// NewRedisStateReaderWithLogger creates a new instance of RedisStateReader with a custom logger
+func NewRedisStateReaderWithLogger(client *redis.Client, logger log.Logger) *RedisStateReader {
+	ctx, _ := context.WithCancel(context.Background())
+	return &RedisStateReader{
+		client:   client,
+		ctx:      ctx,
+		logger:   logger,
+		blockNum: 0,
+	}
+}
+
+// NewRedisStateReaderAtBlock creates a new instance of RedisStateReader at a specific block height
+func NewRedisStateReaderAtBlock(client *redis.Client, blockNum uint64) *RedisStateReader {
+	ctx, _ := context.WithCancel(context.Background())
+	return &RedisStateReader{
+		client:   client,
+		ctx:      ctx,
+		logger:   log.Root(),
+		blockNum: blockNum,
 	}
 }
 
@@ -73,6 +102,18 @@ func NewRedisStateWriter(client *redis.Client, blockNum uint64) *RedisStateWrite
 	return &RedisStateWriter{
 		client:   client,
 		ctx:      ctx,
+		logger:   log.Root(),
+		blockNum: blockNum,
+	}
+}
+
+// NewRedisStateWriterWithLogger creates a new instance of RedisStateWriter with a custom logger
+func NewRedisStateWriterWithLogger(client *redis.Client, blockNum uint64, logger log.Logger) *RedisStateWriter {
+	ctx, _ := context.WithCancel(context.Background())
+	return &RedisStateWriter{
+		client:   client,
+		ctx:      ctx,
+		logger:   logger,
 		blockNum: blockNum,
 	}
 }
@@ -121,17 +162,17 @@ func codeKey(codeHash libcommon.Hash) string {
 	return fmt.Sprintf("code:%s", codeHash.Hex())
 }
 
-// ReadAccountData reads account data from Redis
-func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts.Account, error) {
+// ReadAccountDataAtBlock reads account data from Redis at a specific block height
+func (r *RedisStateReader) ReadAccountDataAtBlock(address libcommon.Address, blockNum uint64) (*accounts.Account, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
 	
 	key := accountKey(address)
 
-	// Get the most recent account data before or at current block
+	// Get the most recent account data before or at the specified block
 	result := r.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 		Min:    "0",
-		Max:    "+inf",
+		Max:    fmt.Sprintf("%d", blockNum),
 		Offset: 0,
 		Count:  1,
 	})
@@ -140,12 +181,12 @@ func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts
 		if result.Err() == redis.Nil {
 			return nil, nil // Account doesn't exist
 		}
-		return nil, result.Err()
+		return nil, fmt.Errorf("redis error reading account %s at block %d: %w", address.Hex(), blockNum, result.Err())
 	}
 
 	values, err := result.Result()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get account result: %w", err)
 	}
 
 	if len(values) == 0 {
@@ -170,22 +211,28 @@ func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts
 	}, nil
 }
 
+// ReadAccountData reads account data from Redis at latest block
+func (r *RedisStateReader) ReadAccountData(address libcommon.Address) (*accounts.Account, error) {
+	// For compatibility, we'll use a very large block number to get the latest state
+	return r.ReadAccountDataAtBlock(address, math.MaxUint64)
+}
+
 // ReadAccountDataForDebug reads account data from Redis for debugging
 func (r *RedisStateReader) ReadAccountDataForDebug(address libcommon.Address) (*accounts.Account, error) {
 	return r.ReadAccountData(address)
 }
 
-// ReadAccountStorage reads account storage from Redis
-func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash) ([]byte, error) {
+// ReadAccountStorageAtBlock reads account storage from Redis at a specific block height
+func (r *RedisStateReader) ReadAccountStorageAtBlock(address libcommon.Address, incarnation uint64, key *libcommon.Hash, blockNum uint64) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
 	
 	storageKeyStr := storageKey(address, key)
 
-	// Get the most recent storage data before or at current block
+	// Get the most recent storage data before or at the specified block
 	result := r.client.ZRevRangeByScore(ctx, storageKeyStr, &redis.ZRangeBy{
 		Min:    "0",
-		Max:    "+inf",
+		Max:    fmt.Sprintf("%d", blockNum),
 		Offset: 0,
 		Count:  1,
 	})
@@ -194,7 +241,8 @@ func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarna
 		if result.Err() == redis.Nil {
 			return nil, nil // Storage doesn't exist
 		}
-		return nil, fmt.Errorf("redis error reading storage %s: %w", storageKeyStr, result.Err())
+		return nil, fmt.Errorf("redis error reading storage %s at block %d: %w", 
+			storageKeyStr, blockNum, result.Err())
 	}
 
 	values, err := result.Result()
@@ -206,7 +254,21 @@ func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarna
 		return nil, nil // Storage doesn't exist
 	}
 
+	// Empty string means zero value - return empty bytes
+	if len(values[0]) == 0 {
+		return []byte{}, nil
+	}
+
 	return []byte(values[0]), nil
+}
+
+// ReadAccountStorage reads account storage from Redis at latest block
+func (r *RedisStateReader) ReadAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash) ([]byte, error) {
+	blockNum := r.blockNum
+	if blockNum == 0 {
+		blockNum = math.MaxUint64 // Latest state
+	}
+	return r.ReadAccountStorageAtBlock(address, incarnation, key, blockNum)
 }
 
 // ReadAccountCode reads account code from Redis
